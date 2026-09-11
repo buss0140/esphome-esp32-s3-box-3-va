@@ -3083,3 +3083,20 @@ lvgl:
             text: ""
             text_font: font_body
             text_color: 0xC8C8C8
+- id: replying_when_local_audible
+  mode: restart
+  then:
+    - wait_until:
+        condition:
+          or:
+            - speaker.is_playing:
+            - media_player.is_announcing:
+        timeout: 5s
+    - if:
+        condition:
+          lambda: return id(tts_reply_active);
+        then:
+          - lambda: |-
+              id(tts_audible_ms) = millis();
+              id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
+          - script.execute: draw_display
