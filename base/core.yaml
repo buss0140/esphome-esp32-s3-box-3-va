@@ -234,6 +234,30 @@ substitutions:
   # ones finish on the per-character estimate long before it.
   tts_hold_max_ms: '60000'
 
+  # THE MOUTH STARTS BEFORE THE SOUND DOES, on the external path. `on_tts_start`
+  # fires when the reply TEXT arrives, and on "This device" that is the right
+  # moment - the decode is already coming, so face and sound begin together. On
+  # "External player" nothing has left the box yet: the URL is not handed to
+  # Home Assistant until `on_tts_end`, and a HomePod reached through Music
+  # Assistant's AirPlay provider then opens a RAOP session before the room hears
+  # anything. That is seconds of a character talking to silence, every reply.
+  #
+  # `tts_hold_lead_ms` never fixed this: it pads the END of the hold, so the old
+  # behaviour was an animation that started early AND ran late. It still covers
+  # the tail on the blind path; the START is handled by waiting for the speaker.
+  #
+  # How long to wait for `external_player_state` to reach `playing` before
+  # animating anyway. A face that is late by a little beats one that never
+  # moves, so this is a ceiling, not a schedule.
+  tts_audible_wait_ms: '6000'
+  # ...and what to do when that state is no use at all. Not every player reports
+  # playback - `off` for the whole reply is the documented kitchen case, and the
+  # same reason on_end carries its own fallback. When the state is empty,
+  # unknown, unavailable or off, stop trusting it after this long and animate on
+  # a fixed lead instead. ~1.8 s is a HomePod over AirPlay, measured from the URL
+  # going out to the first sound; a Chromecast is quicker, a slow mesh slower.
+  tts_audible_blind_ms: '1800'
+
 
   # Bare-core screen text. Overridable by a language package like everything
   # else the UI says - see base/lang/README.md.
@@ -907,6 +931,9 @@ voice_assistant:
     - lambda: |-
         id(tts_chars) = x.length();
         id(tts_started_ms) = millis();
+        // Cleared, not carried over. A stale value from the previous reply would
+        // hand on_end a deadline that expired minutes ago.
+        id(tts_audible_ms) = 0;
         id(tts_reply_active) = true;
     # BARGE-IN, part 2, 2026-07-31. `micro_wake_word` turns itself off the
     # instant a pipeline leaves IDLE and, left alone, only comes back via
@@ -964,8 +991,25 @@ voice_assistant:
     - text_sensor.template.publish:
         id: text_response
         state: !lambda return x;
-    - lambda: id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
-    - script.execute: draw_display
+    # THE MOUTH WAITS FOR THE SOUND, on the external path only. The reasoning is
+    # with `tts_audible_wait_ms` up in the substitutions; the short version is
+    # that on "External player" this trigger fires seconds before the speaker
+    # makes a noise, and animating here meant a character talking to an empty
+    # room for all of it.
+    #
+    # "Both" is deliberately NOT deferred. The box's own speaker is playing in
+    # that mode, so the sound is immediate and the face should match the speaker
+    # the listener is standing next to - which is this one.
+    - if:
+        condition:
+          lambda: return id(tts_output).current_option() == "External player";
+        then:
+          - script.execute: replying_when_audible
+        else:
+          - lambda: |-
+              id(tts_audible_ms) = millis();
+              id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
+          - script.execute: draw_display
   # `x` is the TTS media URL. This trigger also fires for HA's "announce" API
   # when no media player is attached, so announcements follow the same routing.
   on_tts_end:
@@ -1081,11 +1125,20 @@ voice_assistant:
                 # length of the reply. In "Both" that doubled the deafness: the
                 # box finished speaking, and only then did the clock for the
                 # external speaker start.
+                # MEASURED FROM THE SOUND, NOT FROM THE TEXT. `tts_audible_ms`
+                # is when the speaker actually started (0 if that was never
+                # established). Deferring the animation's start without moving
+                # this too would cut the mouth off early by exactly the latency
+                # the defer exists to absorb. On the blind path there is no such
+                # timestamp, so it falls back to the old base - the text arriving
+                # - and keeps `tts_hold_lead_ms` as the guess for the lag.
                 - lambda: |-
-                    uint32_t ms = ${tts_hold_lead_ms} + ${tts_hold_base_ms}
+                    uint32_t ms = ${tts_hold_base_ms}
                                 + (uint32_t) id(tts_chars) * ${tts_hold_ms_per_char};
+                    uint32_t from = id(tts_audible_ms);
+                    if (from == 0) { from = id(tts_started_ms); ms += ${tts_hold_lead_ms}; }
                     if (ms > ${tts_hold_max_ms}) ms = ${tts_hold_max_ms};
-                    id(hold_deadline) = id(tts_started_ms) + ms;
+                    id(hold_deadline) = from + ms;
                 - wait_until:
                     condition:
                       lambda: |-
@@ -1119,10 +1172,12 @@ voice_assistant:
                 # from here. Clamped at zero, because by this point the reply has
                 # often already outlived it.
                 - delay: !lambda |-
-                    uint32_t ms = ${tts_hold_lead_ms} + ${tts_hold_base_ms}
+                    uint32_t ms = ${tts_hold_base_ms}
                                 + (uint32_t) id(tts_chars) * ${tts_hold_ms_per_char};
+                    uint32_t from = id(tts_audible_ms);
+                    if (from == 0) { from = id(tts_started_ms); ms += ${tts_hold_lead_ms}; }
                     if (ms > ${tts_hold_max_ms}) ms = ${tts_hold_max_ms};
-                    const uint32_t deadline = id(tts_started_ms) + ms;
+                    const uint32_t deadline = from + ms;
                     const uint32_t now = millis();
                     return now >= deadline ? 0 : deadline - now;
     # AMPLIFIER BACK ON, unconditionally. Not "if we turned it off" - if that ever
@@ -1389,8 +1444,59 @@ globals:
     type: uint32_t
     restore_value: false
     initial_value: "0"
+  # When the reply became AUDIBLE, in millis(), or 0 if that is not known yet.
+  # On "This device" it is the same instant as tts_started_ms. On "External
+  # player" it is when the speaker actually started, which is what the hold in
+  # on_end has to measure from - otherwise the fix below moves the animation's
+  # start and leaves its end where it was, cutting the mouth off early by
+  # exactly the latency we just stopped ignoring.
+  - id: tts_audible_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
 
 script:
+  # Enter the replying phase when the EXTERNAL speaker actually starts, rather
+  # than when the reply text arrived - see on_tts_start. Runs in parallel with
+  # the rest of the pipeline: it is started from on_tts_start, and the thing it
+  # is waiting for does not even get requested until on_tts_end hands the URL to
+  # Home Assistant. Until it fires the face stays in `thinking`, which is what
+  # the box is honestly still doing.
+  #
+  # `mode: restart` because a second reply, or a barge-in, must not leave an
+  # older copy of this waiting to flip the phase out from under the new one.
+  - id: replying_when_audible
+    mode: restart
+    then:
+      - wait_until:
+          condition:
+            lambda: |-
+              const std::string &st = id(external_player_state).state;
+              // The honest signal, and the one worth waiting for.
+              if (st == "playing") return true;
+              // NOT EVERY PLAYER REPORTS PLAYBACK. `off` for the length of the
+              // reply is the documented kitchen case and on_end already carries
+              // a fallback for it; treat it like `unknown` rather than like a
+              // speaker that is genuinely silent, or this waits the full
+              // ceiling on every single answer.
+              const bool visible = !st.empty() && st != "unknown"
+                                && st != "unavailable" && st != "off";
+              if (visible) return false;
+              return (millis() - id(tts_started_ms)) > ${tts_audible_blind_ms};
+          timeout: ${tts_audible_wait_ms}ms
+      # GUARD, because this can arrive late. The wait above allows seconds, and
+      # a reply can be cancelled inside that window - by barge-in, by the button,
+      # by the pipeline erroring out. Without this the phase gets forced back to
+      # `replying` over a screen that has already moved on, which is the same
+      # class of bug as the late tail in on_end.
+      - if:
+          condition:
+            lambda: return id(tts_reply_active);
+          then:
+            - lambda: |-
+                id(tts_audible_ms) = millis();
+                id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
+            - script.execute: draw_display
   # Boot dots: the lit one grows and goes fully opaque, the others sit back, and
   # all three cross-fade through the palette a third of a cycle apart.
   - id: boot_animate
