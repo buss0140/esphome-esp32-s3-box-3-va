@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+### Fixed - the avatar started talking before the external speaker did
+
+On `External player` the character began its replying animation the moment the
+reply TEXT arrived, which is `on_tts_start`. Nothing has left the box at that
+point: the TTS URL is not handed to Home Assistant until `on_tts_end`, and a
+HomePod reached through Music Assistant's AirPlay provider then opens a RAOP
+session before it makes a sound. The gap is seconds, and the face spent all of
+it talking to a silent room.
+
+`tts_hold_lead_ms` was not the fix and never had been - it pads the *end* of the
+hold, so the behaviour it produced was an animation that started early **and**
+ran late, which is why the two halves never lined up by tuning it.
+
+Now the replying phase waits for the speaker. `replying_when_audible` watches
+`external_player_state` and flips the phase when it reaches `playing`; the face
+stays in `thinking` until then, which is what the box is honestly still doing.
+Two escapes, because not every player tells the truth:
+
+- **No usable state** (empty, `unknown`, `unavailable`, or `off` - the last is
+  the documented kitchen case, already the reason `on_end` carries a fallback):
+  stop waiting after `tts_audible_blind_ms` (1.8 s, a HomePod over AirPlay,
+  measured URL-out to first sound) and animate blind.
+- **A player that reports something else and never moves**: a hard ceiling of
+  `tts_audible_wait_ms` (6 s), then animate anyway. Late by a little beats a
+  face that never moves.
+
+The hold in `on_end` is now measured from `tts_audible_ms` - when the sound
+actually started - instead of `tts_started_ms`. Without that, moving the start
+and leaving the end alone would cut the mouth off early by exactly the latency
+the wait exists to absorb. The blind path has no such timestamp, so it falls
+back to the old base and keeps `tts_hold_lead_ms` as its guess for the lag.
+
+`Both` is deliberately not deferred: the box's own speaker is playing, so the
+sound is immediate and the face should match the speaker in the room.
+
+Cancelled replies were the trap in review - the wait allows seconds, and a
+barge-in inside that window would have had a late script force `replying` over a
+screen that had already moved on. `mode: restart` plus a `tts_reply_active`
+guard, the same shape as the late-tail guard in `on_end`.
+
 First build. A port of the upstream
 [`esphome/wake-word-voice-assistants`](https://github.com/esphome/wake-word-voice-assistants)
 ESP32-S3-BOX-3 config, rebuilt as a package + thin-config repo.
