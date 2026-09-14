@@ -54,6 +54,11 @@ substitutions:
   # Nothing here changes the data or the layout, only the paint.
   home_bg_color: '0x000000'
   home_clock_color: '0xFFFFFF'
+  # 24-hour or 12-hour clock. 'true' keeps 13:05; 'false' gives 1:05, with the
+  # leading zero dropped, which is how a 12-hour clock is normally written. No
+  # AM/PM suffix - at 64 px it would not fit beside the hero clock, and a
+  # separate small label is a screen change rather than a format change.
+  home_clock_24h: 'true'
   home_date_color: '0x8A8A8A'
   home_hint_color: '0x5A5A5A'
   home_climate_color: '0xC8C8C8'
@@ -136,7 +141,14 @@ script:
                     return std::string("--:--");
                   }
                   char buf[8];
-                  snprintf(buf, sizeof(buf), "%02d:%02d", now.hour, now.minute);
+                  int h = now.hour;
+                  if (${home_clock_24h}) {
+                    snprintf(buf, sizeof(buf), "%02d:%02d", h, now.minute);
+                  } else {
+                    h = h % 12;
+                    if (h == 0) h = 12;
+                    snprintf(buf, sizeof(buf), "%d:%02d", h, now.minute);
+                  }
                   return std::string(buf);
       # The date changes once a day, but this script runs on every minute
       # boundary. lv_label_set_text never compares - it reallocs, copies and
