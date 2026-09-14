@@ -1035,7 +1035,7 @@ voice_assistant:
                 entity_id: ${external_media_player_id}
                 media_content_id: !lambda 'return x;'
                 media_content_type: music
-                announce: "true"
+                # announce: "true"
     - if:
         condition:
           lambda: return id(tts_output).current_option() == "External player";
