@@ -997,19 +997,15 @@ voice_assistant:
     # makes a noise, and animating here meant a character talking to an empty
     # room for all of it.
     #
-    # "Both" is deliberately NOT deferred. The box's own speaker is playing in
-    # that mode, so the sound is immediate and the face should match the speaker
-    # the listener is standing next to - which is this one.
-    - if:
-        condition:
-          lambda: return id(tts_output).current_option() == "External player";
-        then:
-          - script.execute: replying_when_audible
-        else:
-          - lambda: |-
-              id(tts_audible_ms) = millis();
-              id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
-          - script.execute: draw_display
+    # EVERY ROUTING, not just the external one. The first version of this
+    # deferred only on "External player", reasoning that the box's own speaker
+    # starts immediately. It does not: ESPHome has to fetch and decode the FLAC
+    # before any sound comes out, a gap this repo's own on_tts_start comment
+    # already measures at ~1.5 s, and confirmed on device at 1.5-2 s of a mouth
+    # moving in silence with the reply coming out of the box itself. Which
+    # speaker is playing changes WHICH signal says "audible", not whether the
+    # wait is needed.
+    - script.execute: replying_when_audible
   # `x` is the TTS media URL. This trigger also fires for HA's "announce" API
   # when no media player is attached, so announcements follow the same routing.
   on_tts_end:
@@ -1468,21 +1464,49 @@ script:
   - id: replying_when_audible
     mode: restart
     then:
+      # DRAIN THE PREVIOUS REPLY FIRST. Barge-in means a new question can arrive
+      # while the last answer is still coming out of the speaker, and then
+      # `speaker.is_playing` is ALREADY true when this starts - the wait below
+      # would return instantly and put the bug straight back. Wait for silence
+      # first, briefly, so what the next wait sees is a rising edge rather than
+      # the tail of the old reply. Short timeout: if it never goes quiet,
+      # animating slightly early beats not animating at all.
+      - if:
+          condition:
+            - lambda: return id(tts_output).current_option() != "External player";
+            - speaker.is_playing:
+          then:
+            - wait_until:
+                condition:
+                  not:
+                    speaker.is_playing:
+                timeout: 2s
       - wait_until:
           condition:
-            lambda: |-
-              const std::string &st = id(external_player_state).state;
-              // The honest signal, and the one worth waiting for.
-              if (st == "playing") return true;
-              // NOT EVERY PLAYER REPORTS PLAYBACK. `off` for the length of the
-              // reply is the documented kitchen case and on_end already carries
-              // a fallback for it; treat it like `unknown` rather than like a
-              // speaker that is genuinely silent, or this waits the full
-              // ceiling on every single answer.
-              const bool visible = !st.empty() && st != "unknown"
-                                && st != "unavailable" && st != "off";
-              if (visible) return false;
-              return (millis() - id(tts_started_ms)) > ${tts_audible_blind_ms};
+            or:
+              # LOCAL PATHS ("This device", "Both"): audio actually flowing out
+              # of the box. Deliberately NOT `media_player.is_announcing` -
+              # that goes true the moment the URL arrives, which is the start
+              # of the very gap being covered here, not the end of it.
+              - and:
+                  - lambda: return id(tts_output).current_option() != "External player";
+                  - speaker.is_playing:
+              # EXTERNAL ONLY: the box makes no sound at all, so Home Assistant
+              # is the only witness.
+              - and:
+                  - lambda: return id(tts_output).current_option() == "External player";
+                  - lambda: return id(external_player_state).state == "playing";
+              # ...and the blind fallback for an external player that never
+              # reports playback. `off` for the length of the reply is the
+              # documented kitchen case, and on_end already carries a fallback
+              # for it; treat it like `unknown` rather than like a speaker that
+              # is genuinely silent, or this waits the full ceiling every time.
+              - lambda: |-
+                  if (id(tts_output).current_option() != "External player") return false;
+                  const std::string &st = id(external_player_state).state;
+                  const bool visible = !st.empty() && st != "unknown"
+                                    && st != "unavailable" && st != "off";
+                  return !visible && (millis() - id(tts_started_ms)) > ${tts_audible_blind_ms};
           timeout: ${tts_audible_wait_ms}ms
       # GUARD, because this can arrive late. The wait above allows seconds, and
       # a reply can be cancelled inside that window - by barge-in, by the button,
@@ -3083,20 +3107,3 @@ lvgl:
             text: ""
             text_font: font_body
             text_color: 0xC8C8C8
-- id: replying_when_local_audible
-  mode: restart
-  then:
-    - wait_until:
-        condition:
-          or:
-            - speaker.is_playing:
-            - media_player.is_announcing:
-        timeout: 5s
-    - if:
-        condition:
-          lambda: return id(tts_reply_active);
-        then:
-          - lambda: |-
-              id(tts_audible_ms) = millis();
-              id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
-          - script.execute: draw_display
